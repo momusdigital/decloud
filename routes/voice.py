@@ -632,6 +632,21 @@ def _set_job(job_id, state, message):
         _setup_jobs[job_id] = {'state': state, 'message': message, 'ts': time.time()}
 
 
+def _start_setup_job(job_id, target, *args):
+    with _setup_lock:
+        job = _setup_jobs.get(job_id, {})
+        if job.get('state') in ('queued', 'running'):
+            return jsonify({'status': 'running', 'job': job_id,
+                            'message': job['message']}), 202
+        _setup_jobs[job_id] = {'state': 'queued', 'message': 'Queued', 'ts': time.time()}
+    try:
+        threading.Thread(target=target, args=(job_id, *args), daemon=True).start()
+    except (RuntimeError, OSError) as e:
+        _set_job(job_id, 'error', 'Could not start setup: ' + str(e))
+        return jsonify({'error': 'could not start setup', 'job': job_id}), 500
+    return jsonify({'status': 'started', 'job': job_id}), 202
+
+
 def _valid_model_name(name):
     return bool(re.match(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(:[A-Za-z0-9._-]+)?$', name))
 
@@ -682,12 +697,7 @@ def _run_ollama_pull(job_id, model):
 @bp.route('/api/voice/ollama/install', methods=['POST'])
 @limiter.limit("5 per hour")
 def voice_ollama_install():
-    job_id = 'install_ollama'
-    with _setup_lock:
-        if _setup_jobs.get(job_id, {}).get('state') == 'running':
-            return jsonify({'status': 'running', 'message': _setup_jobs[job_id]['message']}), 202
-    threading.Thread(target=_run_ollama_install, args=(job_id,), daemon=True).start()
-    return jsonify({'status': 'started', 'job': job_id}), 202
+    return _start_setup_job('install_ollama', _run_ollama_install)
 
 
 @bp.route('/api/voice/ollama/pull', methods=['POST'])
@@ -700,11 +710,7 @@ def voice_ollama_pull():
     if not _valid_model_name(model):
         return jsonify({'error': 'invalid model name'}), 400
     job_id = 'pull_' + re.sub(r'[^A-Za-z0-9_-]', '_', model)
-    with _setup_lock:
-        if _setup_jobs.get(job_id, {}).get('state') == 'running':
-            return jsonify({'status': 'running', 'job': job_id}), 202
-    threading.Thread(target=_run_ollama_pull, args=(job_id, model), daemon=True).start()
-    return jsonify({'status': 'started', 'job': job_id}), 202
+    return _start_setup_job(job_id, _run_ollama_pull, model)
 
 
 # ─── Piper voice model download (one-click install of a missing voice) ──
@@ -747,8 +753,4 @@ def voice_tts_install():
     if TTS_ENGINES[engine_id]['engine'] == 'browser':
         return jsonify({'status': 'done', 'message': 'Browser voice needs no install'})
     job_id = 'voice_' + engine_id
-    with _setup_lock:
-        if _setup_jobs.get(job_id, {}).get('state') == 'running':
-            return jsonify({'status': 'running', 'job': job_id}), 202
-    threading.Thread(target=_run_voice_download, args=(job_id, engine_id), daemon=True).start()
-    return jsonify({'status': 'started', 'job': job_id}), 202
+    return _start_setup_job(job_id, _run_voice_download, engine_id)
