@@ -45,6 +45,32 @@ def test_retry_reuses_queued_job(client, auth_headers, dispatch):
     assert not any(k.startswith('_') for k in listing.json['downloads'][0])
 
 
+def test_retry_does_not_depend_on_catalog_availability(client, auth_headers, dispatch, monkeypatch):
+    first = client.post('/api/models/download', json=BODY, headers=auth_headers)
+    monkeypatch.setattr(models, 'analyze_repo', lambda *a: {'error': 'catalog offline'})
+    retry = client.post('/api/models/download', json=BODY, headers=auth_headers)
+    assert retry.status_code == 200
+    assert retry.json['download_id'] == first.json['download_id']
+    assert len(dispatch) == 1
+
+
+def test_private_split_parts_do_not_reserve_unrelated_outputs(client, auth_headers, dispatch):
+    parts = ['model-00001-of-00002.gguf', 'model-00002-of-00002.gguf']
+    split = {**BODY, 'files': parts}
+    single = {**BODY, 'files': [parts[0]]}
+    assert client.post('/api/models/download', json=split, headers=auth_headers).status_code == 200
+    assert client.post('/api/models/download', json=single, headers=auth_headers).status_code == 200
+    assert len(dispatch) == 2
+
+
+def test_long_split_names_do_not_collide_in_staging(client, auth_headers, dispatch):
+    prefix = 'model-' + 'x' * 90
+    parts = [prefix + '-00001-of-00002.gguf', prefix + '-00002-of-00002.gguf']
+    response = client.post('/api/models/download', json={**BODY, 'files': parts}, headers=auth_headers)
+    assert response.status_code == 200
+    assert len(dispatch) == 1
+
+
 def test_other_repo_cannot_write_active_target(client, auth_headers, dispatch):
     first = client.post('/api/models/download', json=BODY, headers=auth_headers)
     conflict = client.post('/api/models/download', json={**BODY, 'repo': 'other/model'},
@@ -136,9 +162,10 @@ def test_cancelled_queued_job_does_not_download(monkeypatch):
     assert models._downloads['job']['state'] == 'cancelled'
 
 
-def test_split_download_publishes_only_complete_merge(tmp_path, monkeypatch):
-    parts = ['model-00001-of-00002.gguf', 'model-00002-of-00002.gguf']
-    final = tmp_path / 'model.gguf'
+@pytest.mark.parametrize('prefix', ['model', 'model-' + 'x' * 90])
+def test_split_download_publishes_only_complete_merge(tmp_path, monkeypatch, prefix):
+    parts = [prefix + '-00001-of-00002.gguf', prefix + '-00002-of-00002.gguf']
+    final = tmp_path / models._merged_name(parts[0])
     final.write_bytes(b'old')
     models._downloads['job'] = {'state': 'queued'}
 

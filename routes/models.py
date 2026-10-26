@@ -249,6 +249,11 @@ def _merged_name(first_part: str) -> str:
     return _slug(re.sub(r'-\d+-of-\d+(?=\.gguf$)', '', first_part.split('/')[-1]))
 
 
+def _download_path(parts: list, category: str) -> Path:
+    name = _merged_name(parts[0]) if len(parts) > 1 else _slug(parts[0])
+    return _target_dir(category) / name
+
+
 def _ollama_import(gguf_path: Path, name: str) -> tuple:
     """Make a downloaded chat GGUF usable in the AI Chat app."""
     modelfile = gguf_path.with_suffix('.Modelfile')
@@ -269,7 +274,8 @@ def _ollama_import(gguf_path: Path, name: str) -> tuple:
 
 def _download_worker(dl_id: str, repo: str, parts: list, category: str,
                      import_ollama: bool):
-    dest_dir = _target_dir(category)
+    final = _download_path(parts, category)
+    dest_dir = final.parent
     try:
         with _download_lock:
             if _downloads[dl_id]['state'] == 'cancelling':
@@ -282,9 +288,7 @@ def _download_worker(dl_id: str, repo: str, parts: list, category: str,
         # replace the destination. The context also cleans up on failure.
         with tempfile.TemporaryDirectory(prefix='.decloud-', dir=dest_dir) as scratch:
             staging = Path(scratch)
-            parts_dir = staging / 'parts'
-            parts_dir.mkdir()
-            for fname in parts:
+            for index, fname in enumerate(parts):
                 url = HF_RESOLVE.format(repo=repo, file=fname)
                 with _requests.get(url, stream=True, timeout=30) as r:
                     r.raise_for_status()
@@ -295,7 +299,7 @@ def _download_worker(dl_id: str, repo: str, parts: list, category: str,
                             return
                         _downloads[dl_id].update({'total_bytes': total_size,
                                                  'state': 'downloading'})
-                    with open(parts_dir / _slug(fname), 'wb') as f:
+                    with open(staging / str(index), 'wb') as f:
                         for chunk in r.iter_content(chunk_size=1024 * 256):
                             with _download_lock:
                                 if _downloads[dl_id]['state'] == 'cancelling':
@@ -316,13 +320,11 @@ def _download_worker(dl_id: str, repo: str, parts: list, category: str,
             if len(parts) > 1:
                 staged_final = staging / 'merged.gguf'
                 with open(staged_final, 'wb') as out:
-                    for fname in parts:
-                        with open(parts_dir / _slug(fname), 'rb') as f:
+                    for index in range(len(parts)):
+                        with open(staging / str(index), 'rb') as f:
                             shutil.copyfileobj(f, out, length=1024 * 1024)
-                final = dest_dir / _merged_name(parts[0])
             else:
-                staged_final = parts_dir / _slug(parts[0])
-                final = dest_dir / _slug(parts[0])
+                staged_final = staging / '0'
             staged_final.replace(final)
 
         with _download_lock:
@@ -401,28 +403,38 @@ def models_download():
     fname = str(data.get('file', '')).strip()
     file_list = data.get('files')
     category = str(data.get('category', 'chat')).strip()
-    import_ollama = bool(data.get('import_ollama', category == 'chat'))
+    import_ollama = category == 'chat' and bool(data.get('import_ollama', True))
 
     if not REPO_PATTERN.match(repo):
         return jsonify({'error': 'invalid repo name'}), 400
     if category not in ('chat', 'image', 'video', 'music'):
         return jsonify({'error': 'invalid category'}), 400
 
-    specs = get_specs()
-    analysis = analyze_repo(repo, category, specs)
-
-    # Resolve what to download: explicit part list, or one file entry
+    # Validate the request before looking for an active retry. Reusing a
+    # running job must not depend on the catalog being reachable again.
     parts = []
     if isinstance(file_list, list) and file_list:
         parts = [str(f) for f in file_list]
-        if not parts or not all(FILE_PATTERN.match(f) for f in parts):
+        if not all(FILE_PATTERN.match(f) for f in parts) or len(set(parts)) != len(parts):
             return jsonify({'error': 'invalid file list'}), 400
-        total_gb = round(sum(
-            next((f['size_gb'] for f in analysis.get('files', [])
-                  if f['file'] == p), 0) for p in parts), 2)
     elif fname:
         if not FILE_PATTERN.match(fname):
             return jsonify({'error': 'invalid file name'}), 400
+    else:
+        return jsonify({'error': 'file or files required'}), 400
+
+    key = (repo, tuple(parts) if parts else fname, category, import_ollama)
+    with _download_lock:
+        for existing in _downloads.values():
+            if existing['state'] not in ('done', 'error', 'cancelled') and existing.get('_key') == key:
+                return jsonify({'ok': True, 'download_id': existing['id']})
+
+    analysis = analyze_repo(repo, category, get_specs())
+    if parts:
+        total_gb = round(sum(
+            next((f['size_gb'] for f in analysis.get('files', [])
+                  if f['file'] == p), 0) for p in parts), 2)
+    else:
         file_info = next((f for f in analysis.get('files', [])
                           if f['file'] == fname), None)
         if file_info is None:
@@ -432,16 +444,8 @@ def models_download():
                                      f"({file_info['size_gb']} GB)"}), 409
         parts = file_info.get('parts') or [fname]
         total_gb = file_info['size_gb']
-    else:
-        return jsonify({'error': 'file or files required'}), 400
-
-    if len({_slug(part) for part in parts}) != len(parts):
-        return jsonify({'error': 'file list contains colliding output names'}), 400
-    key = (repo, tuple(parts), category, import_ollama)
-    targets = {_target_dir(category) / _slug(part) for part in parts}
-    if len(parts) > 1:
-        targets.add(_target_dir(category) / _merged_name(parts[0]))
-    targets = {os.path.normcase(str(path.resolve())) for path in targets}
+    final = _download_path(parts, category)
+    target = os.path.normcase(str(final.parent.resolve() / final.name))
     dl_id = f'{int(time.time())}-{uuid.uuid4().hex[:6]}-{_slug(repo)[:16]}-{_slug(parts[0])[:24]}'
     with _download_lock:
         for existing in _downloads.values():
@@ -449,13 +453,13 @@ def models_download():
                 continue
             if existing.get('_key') == key:
                 return jsonify({'ok': True, 'download_id': existing['id']})
-            if targets.intersection(existing.get('_targets', ())):
+            if target == existing.get('_target'):
                 return jsonify({'error': 'another download is using that output path',
                                 'download_id': existing['id']}), 409
         _downloads[dl_id] = {
             'id': dl_id, 'repo': repo, 'file': (fname or parts[0]), 'category': category,
             'state': 'queued', 'done_bytes': 0, 'total_bytes': int(total_gb * 1e9),
-            '_key': key, '_targets': targets,
+            '_key': key, '_target': target,
         }
     try:
         threading.Thread(target=_download_worker,
