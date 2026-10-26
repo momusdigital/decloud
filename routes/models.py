@@ -19,7 +19,9 @@ cancel stops and cleans up. The user never touches the machine.
 from flask import Blueprint, jsonify, request
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -268,56 +270,60 @@ def _ollama_import(gguf_path: Path, name: str) -> tuple:
 def _download_worker(dl_id: str, repo: str, parts: list, category: str,
                      import_ollama: bool):
     dest_dir = _target_dir(category)
-    combined = dest_dir / _merged_name(parts[0])
-    part_path = None
     try:
+        with _download_lock:
+            if _downloads[dl_id]['state'] == 'cancelling':
+                _downloads[dl_id]['state'] = 'cancelled'
+                return
         dest_dir.mkdir(parents=True, exist_ok=True)
         total_size = 0
         done = 0
-        for fname in parts:
-            url = HF_RESOLVE.format(repo=repo, file=fname)
-            dest = dest_dir / _slug(fname)
-            part_path = dest.with_suffix(dest.suffix + '.part')
-            with _requests.get(url, stream=True, timeout=30) as r:
-                r.raise_for_status()
-                total_size += int(r.headers.get('content-length') or 0)
-                with _download_lock:
-                    _downloads[dl_id].update({'total_bytes': total_size,
-                                              'state': 'downloading'})
-                with open(part_path, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 256):
-                        if _downloads.get(dl_id, {}).get('state') == 'cancelling':
-                            break
-                        f.write(chunk)
-                        done += len(chunk)
-                        with _download_lock:
-                            _downloads[dl_id]['done_bytes'] = done
-            if _downloads.get(dl_id, {}).get('state') == 'cancelling':
-                part_path.unlink(missing_ok=True)
-                with _download_lock:
-                    _downloads[dl_id]['state'] = 'cancelled'
-                return
-            part_path.rename(dest)
+        # Keep every partial/merge private until the complete result can
+        # replace the destination. The context also cleans up on failure.
+        with tempfile.TemporaryDirectory(prefix='.decloud-', dir=dest_dir) as scratch:
+            staging = Path(scratch)
+            parts_dir = staging / 'parts'
+            parts_dir.mkdir()
+            for fname in parts:
+                url = HF_RESOLVE.format(repo=repo, file=fname)
+                with _requests.get(url, stream=True, timeout=30) as r:
+                    r.raise_for_status()
+                    total_size += int(r.headers.get('content-length') or 0)
+                    with _download_lock:
+                        if _downloads[dl_id]['state'] == 'cancelling':
+                            _downloads[dl_id]['state'] = 'cancelled'
+                            return
+                        _downloads[dl_id].update({'total_bytes': total_size,
+                                                 'state': 'downloading'})
+                    with open(parts_dir / _slug(fname), 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 256):
+                            with _download_lock:
+                                if _downloads[dl_id]['state'] == 'cancelling':
+                                    _downloads[dl_id]['state'] = 'cancelled'
+                                    return
+                            f.write(chunk)
+                            done += len(chunk)
+                            with _download_lock:
+                                _downloads[dl_id]['done_bytes'] = done
 
-        # Split GGUF archives are byte-concatenable: merge into one file
-        if len(parts) > 1:
             with _download_lock:
+                if _downloads[dl_id]['state'] == 'cancelling':
+                    _downloads[dl_id]['state'] = 'cancelled'
+                    return
                 _downloads[dl_id]['state'] = 'importing'
-            with open(combined, 'wb') as out:
-                for fname in parts:
-                    src = dest_dir / _slug(fname)
-                    with open(src, 'rb') as f:
-                        while True:
-                            chunk = f.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            out.write(chunk)
-                    src.unlink(missing_ok=True)
-            final = combined
-        else:
-            final = dest_dir / _slug(parts[0])
-            with _download_lock:
-                _downloads[dl_id].update({'state': 'importing', 'path': str(final)})
+
+            # Split GGUF archives are byte-concatenable: merge in staging.
+            if len(parts) > 1:
+                staged_final = staging / 'merged.gguf'
+                with open(staged_final, 'wb') as out:
+                    for fname in parts:
+                        with open(parts_dir / _slug(fname), 'rb') as f:
+                            shutil.copyfileobj(f, out, length=1024 * 1024)
+                final = dest_dir / _merged_name(parts[0])
+            else:
+                staged_final = parts_dir / _slug(parts[0])
+                final = dest_dir / _slug(parts[0])
+            staged_final.replace(final)
 
         with _download_lock:
             _downloads[dl_id].update({'path': str(final)})
@@ -333,10 +339,11 @@ def _download_worker(dl_id: str, repo: str, parts: list, category: str,
         with _download_lock:
             _downloads[dl_id]['state'] = 'done'
     except Exception as e:
-        if part_path:  # never leave a multi-GB partial file behind
-            part_path.unlink(missing_ok=True)
         with _download_lock:
-            _downloads[dl_id].update({'state': 'error', 'error': str(e)[:300]})
+            if _downloads[dl_id]['state'] == 'cancelling':
+                _downloads[dl_id]['state'] = 'cancelled'
+            else:
+                _downloads[dl_id].update({'state': 'error', 'error': str(e)[:300]})
 
 
 # ─── Routes ───────────────────────────────────────────────────────
@@ -428,22 +435,44 @@ def models_download():
     else:
         return jsonify({'error': 'file or files required'}), 400
 
+    if len({_slug(part) for part in parts}) != len(parts):
+        return jsonify({'error': 'file list contains colliding output names'}), 400
+    key = (repo, tuple(parts), category, import_ollama)
+    targets = {_target_dir(category) / _slug(part) for part in parts}
+    if len(parts) > 1:
+        targets.add(_target_dir(category) / _merged_name(parts[0]))
+    targets = {os.path.normcase(str(path.resolve())) for path in targets}
     dl_id = f'{int(time.time())}-{uuid.uuid4().hex[:6]}-{_slug(repo)[:16]}-{_slug(parts[0])[:24]}'
     with _download_lock:
+        for existing in _downloads.values():
+            if existing['state'] in ('done', 'error', 'cancelled'):
+                continue
+            if existing.get('_key') == key:
+                return jsonify({'ok': True, 'download_id': existing['id']})
+            if targets.intersection(existing.get('_targets', ())):
+                return jsonify({'error': 'another download is using that output path',
+                                'download_id': existing['id']}), 409
         _downloads[dl_id] = {
             'id': dl_id, 'repo': repo, 'file': (fname or parts[0]), 'category': category,
             'state': 'queued', 'done_bytes': 0, 'total_bytes': int(total_gb * 1e9),
+            '_key': key, '_targets': targets,
         }
-    threading.Thread(target=_download_worker,
-                     args=(dl_id, repo, parts, category, import_ollama),
-                     daemon=True).start()
+    try:
+        threading.Thread(target=_download_worker,
+                         args=(dl_id, repo, parts, category, import_ollama),
+                         daemon=True).start()
+    except (RuntimeError, OSError) as e:
+        with _download_lock:
+            _downloads[dl_id].update({'state': 'error', 'error': str(e)[:300]})
+        return jsonify({'error': 'could not start download', 'download_id': dl_id}), 500
     return jsonify({'ok': True, 'download_id': dl_id})
 
 
 @bp.route('/api/models/downloads')
 def models_downloads():
     with _download_lock:
-        items = [dict(d) for d in _downloads.values()]
+        items = [{k: v for k, v in d.items() if not k.startswith('_')}
+                 for d in _downloads.values()]
     return jsonify({'downloads': items})
 
 
