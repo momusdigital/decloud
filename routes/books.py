@@ -1,6 +1,6 @@
 """Books library, audio, TTS, summarize, and Q&A routes."""
 from flask import Blueprint, jsonify, request, send_file
-import json, re, subprocess
+import json, re, subprocess, threading
 from shared import (
     app, BASE_DIR, AUDIO_DIR, VOICES, llm_chat,
     get_book_chapter_text, get_text_up_to_position,
@@ -9,6 +9,7 @@ from shared import (
 import shared
 
 bp = Blueprint('books', __name__)
+_tts_start_lock = threading.Lock()
 
 
 @bp.before_request
@@ -467,6 +468,11 @@ def tts_status(book_id):
 @bp.route('/api/tts/start/<book_id>', methods=['POST'])
 def tts_start(book_id):
     """Start TTS generation with the book's configured voice."""
+    with _tts_start_lock:
+        return _tts_start(book_id)
+
+
+def _tts_start(book_id):
     # Check for JSON source first (search subfolders)
     json_matches = list(shared.BOOKS_DIR.rglob(f'{book_id}.json'))
     pdf_matches = list(shared.BOOKS_DIR.rglob(f'{book_id}.pdf'))
@@ -497,16 +503,26 @@ def tts_start(book_id):
         return jsonify({'error': 'Audio is already being generated for this book'}), 409
     lock_file.write_text('0')
     import sys as _sys
-    subprocess.Popen(
-        [_sys.executable, str(worker_script), str(source_path), str(AUDIO_DIR), book_id, voice_id],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
+    try:
+        subprocess.Popen(
+            [_sys.executable, str(worker_script), str(source_path), str(AUDIO_DIR), book_id, voice_id],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except OSError:
+        lock_file.write_text('-1')
+        app.logger.exception('[BOOKS] could not start TTS for %s', book_id)
+        return jsonify({'error': 'could not start audio generation'}), 500
     return jsonify({'status': 'started', 'voice': voice_id})
 
 @bp.route('/api/tts/stop/<book_id>', methods=['POST'])
 def tts_stop(book_id):
     """Stop ongoing TTS generation."""
+    with _tts_start_lock:
+        return _tts_stop(book_id)
+
+
+def _tts_stop(book_id):
     lock_file = AUDIO_DIR / f'{book_id}.tts_lock'
     if lock_file.exists():
         # Write -1 to signal error stop
