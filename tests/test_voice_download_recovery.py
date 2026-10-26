@@ -75,15 +75,54 @@ def test_interrupted_transfer_is_not_published_and_retry_completes(model, server
     assert voice._tts_installed('fixture')
 
 
-def test_interrupted_reinstall_preserves_working_voice(model, server):
+def test_installed_voice_is_reused_without_downloading(model, server):
     model.write_bytes(b'working model')
     config = Path(str(model) + '.json')
     config.write_text('{"voice":"old"}')
     voice._run_voice_download('job', 'fixture')
-    assert voice._setup_jobs['job']['state'] == 'error'
+    assert voice._setup_jobs['job']['state'] == 'done'
+    assert server[1]['requests'] == []
     assert model.read_bytes() == b'working model'
     assert config.read_text() == '{"voice":"old"}'
     assert sorted(p.name for p in model.parent.iterdir()) == ['voice.onnx', 'voice.onnx.json']
+
+
+def test_publication_failure_cannot_change_a_working_voice(model, server, monkeypatch):
+    model.write_bytes(b'working model')
+    config = Path(str(model) + '.json')
+    config.write_text('{"voice":"old"}')
+    server[1]['drop'] = None
+    replace = os.replace
+
+    def fail_model_publish(source, destination):
+        if str(destination) == str(model):
+            raise PermissionError('simulated model file in use')
+        return replace(source, destination)
+
+    monkeypatch.setattr(voice.os, 'replace', fail_model_publish)
+    voice._run_voice_download('job', 'fixture')
+    assert model.read_bytes() == b'working model'
+    assert config.read_text() == '{"voice":"old"}'
+
+
+def test_repair_missing_config_does_not_replace_existing_model(model, server):
+    model.write_bytes(b'working model')
+    voice._run_voice_download('job', 'fixture')
+    assert voice._setup_jobs['job']['state'] == 'done'
+    assert model.read_bytes() == b'working model'
+    assert server[1]['requests'] == ['/voice.onnx.json']
+    assert voice._tts_installed('fixture')
+
+
+def test_repair_missing_model_does_not_replace_existing_config(model, server):
+    config = Path(str(model) + '.json')
+    config.write_text('{"voice":"old"}')
+    server[1]['drop'] = None
+    voice._run_voice_download('job', 'fixture')
+    assert voice._setup_jobs['job']['state'] == 'done'
+    assert config.read_text() == '{"voice":"old"}'
+    assert server[1]['requests'] == ['/voice.onnx']
+    assert voice._tts_installed('fixture')
 
 
 def test_model_without_config_is_not_installed(model):
