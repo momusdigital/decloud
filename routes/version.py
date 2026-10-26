@@ -7,9 +7,19 @@ from flask import Blueprint, jsonify
 
 bp = Blueprint('version', __name__)
 
-VERSION = "0.5.4"
+VERSION = "0.5.5"
 
 CHANGELOG = [
+    {
+        "version": "0.5.5",
+        "date": "2026-10-25",
+        "changes": [
+            "Harden worker retry and stop handling after adversarial review",
+            "Keep voice setup polling active and preserve installed voice files",
+            "Reuse model retries without catalog access and simplify private shard staging",
+            "Wait for owned TTS workers to exit before allowing a restart and show stop failures",
+        ]
+    },
     {
         "version": "0.5.4",
         "date": "2026-10-25",
