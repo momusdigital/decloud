@@ -1,6 +1,7 @@
 """TTS start reservations serialize filesystem checks and recover after spawn failure."""
 from pathlib import Path
 import threading
+import subprocess
 
 import pytest
 
@@ -17,6 +18,7 @@ def lock(tmp_path, monkeypatch):
     (source / 'Example.json').write_text('[]')
     monkeypatch.setattr(shared, 'BOOKS_DIR', source)
     monkeypatch.setattr(books, 'AUDIO_DIR', audio)
+    monkeypatch.setattr(books, '_tts_processes', {}, raising=False)
     return audio / 'Example.tts_lock'
 
 
@@ -63,6 +65,91 @@ def test_overlapping_restart_after_error_launches_once(auth_headers, lock, monke
     assert not errors, errors
     assert sorted(responses) == [200, 409]
     assert len(launches) == 1
+
+
+class Process:
+    def __init__(self):
+        self.alive = True
+        self.waited = False
+        self.unkillable = False
+
+    def poll(self):
+        return None if self.alive else 1
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+    def wait(self, timeout=None):
+        if self.unkillable:
+            raise subprocess.TimeoutExpired('fixture-tts', timeout)
+        self.waited = True
+        self.alive = False
+        return 0
+
+
+@pytest.fixture
+def processes(monkeypatch):
+    launched = []
+
+    def launch(*args, **kwargs):
+        process = Process()
+        launched.append(process)
+        return process
+
+    monkeypatch.setattr(books.subprocess, 'Popen', launch)
+    monkeypatch.setattr(books.subprocess, 'run', lambda *a, **k: None)
+    return launched
+
+
+def test_failed_progress_does_not_override_a_live_child(client, auth_headers, lock, processes):
+    assert client.post('/api/tts/start/Example', headers=auth_headers).status_code == 200
+    lock.write_text('-1')
+    assert client.post('/api/tts/start/Example', headers=auth_headers).status_code == 409
+    assert len(processes) == 1
+
+
+def test_stop_reaps_owned_child_before_restart(client, auth_headers, lock, processes):
+    assert client.post('/api/tts/start/Example', headers=auth_headers).status_code == 200
+    assert client.post('/api/tts/stop/Example', headers=auth_headers).status_code == 200
+    assert processes[0].waited and not processes[0].alive
+    assert client.post('/api/tts/start/Example', headers=auth_headers).status_code == 200
+    assert len(processes) == 2
+
+
+def test_dead_owned_child_does_not_leave_a_stuck_reservation(client, auth_headers, lock, processes):
+    assert client.post('/api/tts/start/Example', headers=auth_headers).status_code == 200
+    processes[0].alive = False  # simulate a hard crash before progress cleanup
+    assert client.post('/api/tts/start/Example', headers=auth_headers).status_code == 200
+    assert len(processes) == 2
+
+
+def test_unconfirmed_stop_cannot_allow_a_second_child(client, auth_headers, lock, processes):
+    assert client.post('/api/tts/start/Example', headers=auth_headers).status_code == 200
+    processes[0].unkillable = True
+    assert client.post('/api/tts/stop/Example', headers=auth_headers).status_code == 500
+    assert client.post('/api/tts/start/Example', headers=auth_headers).status_code == 409
+    assert len(processes) == 1
+
+
+def test_unowned_job_is_not_signalled_or_unreserved(client, auth_headers, lock, monkeypatch):
+    lock.write_text('20')
+    signals = []
+    monkeypatch.setattr(books.subprocess, 'run', lambda *a, **k: signals.append(a))
+    response = client.post('/api/tts/stop/Example', headers=auth_headers)
+    assert response.status_code == 409
+    assert lock.read_text() == '20'
+    assert signals == []
+
+
+def test_stop_without_a_job_is_a_noop(client, auth_headers, lock, monkeypatch):
+    signals = []
+    monkeypatch.setattr(books.subprocess, 'run', lambda *a, **k: signals.append(a))
+    assert client.post('/api/tts/stop/Example', headers=auth_headers).status_code == 200
+    assert not lock.exists()
+    assert signals == []
 
 
 def test_failed_spawn_allows_retry(client, auth_headers, lock, monkeypatch):
