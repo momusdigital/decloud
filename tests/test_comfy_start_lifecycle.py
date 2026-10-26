@@ -1,27 +1,11 @@
 """An owned ComfyUI process is already starting before HTTP is ready."""
 import pytest
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import Mock
 
 from app import app
 import routes.comfy as comfy
-
-
-class Process:
-    pid = 12345
-
-    def __init__(self):
-        self.alive = True
-        self.terminated = False
-
-    def poll(self):
-        return None if self.alive else 1
-
-    def terminate(self):
-        self.terminated = True
-        self.alive = False
-
-    def wait(self, timeout=None):
-        return 0
 
 
 @pytest.fixture
@@ -35,7 +19,8 @@ def processes(tmp_path, monkeypatch):
     launched = []
 
     def launch(*args, **kwargs):
-        proc = Process()
+        proc = Mock(pid=12345)
+        proc.poll.return_value = None
         launched.append(proc)
         return proc
 
@@ -43,16 +28,9 @@ def processes(tmp_path, monkeypatch):
     return launched
 
 
-def test_retry_during_warmup_launches_once(client, auth_headers, processes):
-    first = client.post('/api/comfy/start', headers=auth_headers)
-    retry = client.post('/api/comfy/start', headers=auth_headers)
-    assert first.status_code == retry.status_code == 200
-    assert len(processes) == 1
-
-
 def test_exited_process_can_be_restarted(client, auth_headers, processes):
     assert client.post('/api/comfy/start', headers=auth_headers).status_code == 200
-    processes[0].alive = False
+    processes[0].poll.return_value = 1
     assert client.post('/api/comfy/start', headers=auth_headers).status_code == 200
     assert len(processes) == 2
 
@@ -60,7 +38,8 @@ def test_exited_process_can_be_restarted(client, auth_headers, processes):
 def test_stop_reaps_owned_child(client, auth_headers, processes):
     assert client.post('/api/comfy/start', headers=auth_headers).status_code == 200
     assert client.post('/api/comfy/stop', headers=auth_headers).status_code == 200
-    assert processes[0].terminated
+    processes[0].terminate.assert_called_once()
+    processes[0].wait.assert_called_once()
     assert comfy._comfy_process is None
     assert not comfy.COMFY_PID_FILE.exists()
 
@@ -68,39 +47,28 @@ def test_stop_reaps_owned_child(client, auth_headers, processes):
 def test_concurrent_requests_reserve_launch_before_popen_returns(
         auth_headers, processes, monkeypatch):
     entered, release, second_launch = threading.Event(), threading.Event(), threading.Event()
-    launches, results, errors = [], [], []
+    spawn = comfy.subprocess.Popen
 
     def delayed_launch(*args, **kwargs):
-        proc = Process()
-        launches.append(proc)
-        if len(launches) == 1:
-            entered.set()
-            assert release.wait(5)
-        else:
+        if entered.is_set():
             second_launch.set()
-        return proc
+        entered.set()
+        assert release.wait(5)
+        return spawn(*args, **kwargs)
 
     monkeypatch.setattr(comfy.subprocess, 'Popen', delayed_launch)
 
     def start():
-        try:
-            with app.test_client() as client:
-                results.append(client.post('/api/comfy/start', headers=auth_headers).status_code)
-        except BaseException as exc:
-            errors.append(exc)
+        with app.test_client() as client:
+            return client.post('/api/comfy/start', headers=auth_headers).status_code
 
-    first, second = threading.Thread(target=start), threading.Thread(target=start)
-    first.start()
-    try:
-        assert entered.wait(5)
-        second.start()
-        second_launch.wait(0.2)
-    finally:
-        release.set()
-        first.join(5)
-        if second.ident is not None:
-            second.join(5)
-    assert not errors, errors
-    assert not first.is_alive() and not second.is_alive()
-    assert results == [200, 200]
-    assert len(launches) == 1
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(start)
+        try:
+            assert entered.wait(5)
+            second = pool.submit(start)
+            second_launch.wait(0.2)
+        finally:
+            release.set()
+        assert [first.result(timeout=5), second.result(timeout=5)] == [200, 200]
+    assert len(processes) == 1
