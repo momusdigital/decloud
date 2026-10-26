@@ -500,7 +500,8 @@ def _tts_installed(engine_id):
     engine = TTS_ENGINES.get(engine_id)
     if not engine or engine['engine'] == 'browser':
         return True
-    return bool(engine['model']) and os.path.exists(engine['model'])
+    return bool(engine['model']) and os.path.isfile(engine['model']) and \
+        os.path.isfile(engine['model'] + '.json')
 
 
 def _whisper_available():
@@ -732,12 +733,18 @@ def _run_voice_download(job_id, engine_id):
     _set_job(job_id, 'running', f'Downloading {engine_id} voice…')
     try:
         os.makedirs(os.path.dirname(model_path), exist_ok=True)
-        for suffix in ('.onnx', '.onnx.json'):
-            with _requests.get(base + suffix, stream=True, timeout=300) as r:
-                r.raise_for_status()
-                with open(model_path + suffix, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        f.write(chunk)
+        # Stage both files before publishing either. model_path already
+        # ends in .onnx; appending it again makes an unusable .onnx.onnx.
+        with tempfile.TemporaryDirectory(prefix='.decloud-voice-',
+                                         dir=os.path.dirname(model_path)) as scratch:
+            for suffix in ('.onnx', '.onnx.json'):
+                with _requests.get(base + suffix, stream=True, timeout=300) as r:
+                    r.raise_for_status()
+                    with open(os.path.join(scratch, 'voice' + suffix), 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
+            os.replace(os.path.join(scratch, 'voice.onnx.json'), model_path + '.json')
+            os.replace(os.path.join(scratch, 'voice.onnx'), model_path)
         _set_job(job_id, 'done', f'{engine_id} is ready')
     except Exception as e:
         _set_job(job_id, 'error', 'Voice download failed: ' + str(e))
