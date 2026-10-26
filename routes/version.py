@@ -7,9 +7,18 @@ from flask import Blueprint, jsonify
 
 bp = Blueprint('version', __name__)
 
-VERSION = "0.5.5"
+VERSION = "0.5.6"
 
 CHANGELOG = [
+    {
+        "version": "0.5.6",
+        "date": "2026-10-25",
+        "changes": [
+            "Trim duplicate worker regression tests",
+            "Consolidate overlapping tests and replace custom test doubles with standard mocks",
+            "Reuse the local HTTP fixture to test real installer downloads and HTTP failures",
+        ]
+    },
     {
         "version": "0.5.5",
         "date": "2026-10-25",
